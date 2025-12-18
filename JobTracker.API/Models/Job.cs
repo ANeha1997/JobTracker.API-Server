@@ -5,9 +5,10 @@
         public int Id { get; set; }
 
         // LinkedIn job_id
-        public string ExternalJobId { get; set; } = null!;
+        //public string ExternalJobId { get; set; } = null!;
 
-       
+        public string? ExternalJobId { get; set; }
+
         public string Title { get; set; } = string.Empty;
 
         public string? Location { get; set; }

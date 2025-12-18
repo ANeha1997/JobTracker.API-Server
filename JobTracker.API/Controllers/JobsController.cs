@@ -1,5 +1,4 @@
 ﻿using AutoMapper;
-using AutoMapper.QueryableExtensions;
 using JobTracker.API.Dtos;
 using JobTracker.API.Models;
 using Microsoft.AspNetCore.Authorization;
@@ -37,10 +36,12 @@ namespace JobTracker.API.Controllers
             [FromQuery] int pageSize = 20)
         {
             if (page <= 0) page = 1;
-            if (pageSize <= 0 || pageSize > 1000) pageSize = 50;
+            if (pageSize <= 0) pageSize = 20;
+            if (pageSize > 50) pageSize = 50;   // hard cap
 
+            // IMPORTANT: no Include here (we will Select only needed fields)
             var query = _context.Jobs
-                .Include(j => j.Company)
+                .AsNoTracking()
                 .AsQueryable();
 
             // text search on title
@@ -56,8 +57,7 @@ namespace JobTracker.API.Controllers
                 var loc = location.Trim();
                 query = query.Where(j =>
                     (j.Location != null && j.Location.Contains(loc)) ||
-                    (j.Company != null && j.Company.Location != null &&
-                     j.Company.Location.Contains(loc)));
+                    (j.Company != null && j.Company.Location != null && j.Company.Location.Contains(loc)));
             }
 
             // filter by company
@@ -85,11 +85,24 @@ namespace JobTracker.API.Controllers
 
             var totalCount = await query.CountAsync();
 
+            // Project directly to DTO (fast + avoids AutoMapper loading full entities)
             var items = await query
                 .OrderByDescending(j => j.PostedDate)
                 .Skip((page - 1) * pageSize)
                 .Take(pageSize)
-                .ProjectTo<JobReadDto>(_mapper.ConfigurationProvider)
+                .Select(j => new JobReadDto
+                {
+                    Id = j.Id,
+                    Title = j.Title,
+                    Location = j.Location,
+                    EmploymentType = j.EmploymentType,
+                    SeniorityLevel = j.SeniorityLevel,
+                    SalaryMin = j.SalaryMin,
+                    SalaryMax = j.SalaryMax,
+                    PostedDate = j.PostedDate,
+                    CompanyName = j.Company != null ? j.Company.Name : null,
+                    SourceId = j.SourceId
+                })
                 .ToListAsync();
 
             var result = new PagedResult<JobReadDto>
@@ -110,6 +123,7 @@ namespace JobTracker.API.Controllers
         public async Task<ActionResult<JobReadDto>> GetJob(int id)
         {
             var job = await _context.Jobs
+                .AsNoTracking()
                 .Include(j => j.Company)
                 .FirstOrDefaultAsync(j => j.Id == id);
 
@@ -146,7 +160,7 @@ namespace JobTracker.API.Controllers
             if (job == null)
                 return NotFound();
 
-            _mapper.Map(dto, job);   // copy fields from dto into entity
+            _mapper.Map(dto, job);
             await _context.SaveChangesAsync();
 
             return NoContent();

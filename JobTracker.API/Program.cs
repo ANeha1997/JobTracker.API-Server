@@ -1,9 +1,11 @@
-using JobTracker.API;
+﻿using JobTracker.API;
 using JobTracker.API.Auth;
+using JobTracker.API.Hubs;
 using JobTracker.API.Mapping;
 using JobTracker.API.Models;
 using JobTracker.API.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -16,31 +18,43 @@ System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Inst
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ---------------- CORS: allow Angular dev client ----------------
-var allowedOrigin = "http://localhost:4200";
+// ---------------- CORS: allow Angular (dev + deployed) ----------------
+// IMPORTANT: Use the EXACT origin your browser shows in the address bar
+var allowedOrigins = new[]
+{
+    "http://localhost:4200",
+    "http://100.31.178.60",   // your Angular deployed origin
+    "http://54.164.135.4"     // your API public origin (for swagger/testing)
+};
 
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("FrontendClient", policy =>
     {
-        policy.WithOrigins(allowedOrigin)
+        policy.WithOrigins(allowedOrigins)
               .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials(); 
+              .AllowAnyMethod();
+
+        // JWT bearer (no cookies), so do NOT use AllowCredentials
+        // policy.AllowCredentials(); // <-- keep OFF
     });
 });
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------------
 
-// ? SignalR + set Hub "UserId" = ClaimTypes.NameIdentifier
+// SignalR + set Hub "UserId" = ClaimTypes.NameIdentifier
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<IUserIdProvider, NameIdUserIdProvider>();
 
-// 1) DbContext
+// DbContext (increase timeout so Jobs paging query doesn't die at 30s)
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseSqlServer(connectionString));
+    options.UseSqlServer(connectionString, sql =>
+    {
+        sql.CommandTimeout(120); // seconds (temporary safety net)
+    })
+);
 
-// 2) Identity WITH ROLES
+// Identity WITH ROLES
 builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
 {
     options.User.RequireUniqueEmail = true;
@@ -49,10 +63,10 @@ builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
     options.Password.RequireDigit = false;
     options.Password.RequiredLength = 6;
 })
-    .AddEntityFrameworkStores<ApplicationDbContext>()
-    .AddDefaultTokenProviders();
+.AddEntityFrameworkStores<ApplicationDbContext>()
+.AddDefaultTokenProviders();
 
-// 3) JWT Authentication
+// JWT Authentication
 var jwtSection = builder.Configuration.GetSection("Jwt");
 var jwtKey = jwtSection.GetValue<string>("Key")!;
 var keyBytes = Encoding.UTF8.GetBytes(jwtKey);
@@ -76,7 +90,7 @@ builder.Services
             IssuerSigningKey = new SymmetricSecurityKey(keyBytes)
         };
 
-        // SignalR hub can read JWT from query string 
+        // Allow SignalR token from query string as access_token
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
@@ -95,7 +109,7 @@ builder.Services
         };
     });
 
-// 4) MVC, AutoMapper, Swagger, services
+// MVC + AutoMapper + services + Swagger
 builder.Services.AddControllers();
 builder.Services.AddAutoMapper(typeof(MappingProfile));
 builder.Services.AddScoped<JobImportService>();
@@ -103,11 +117,7 @@ builder.Services.AddScoped<JobImportService>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new OpenApiInfo
-    {
-        Title = "JobTracker.API",
-        Version = "v1"
-    });
+    c.SwaggerDoc("v1", new OpenApiInfo { Title = "JobTracker.API", Version = "v1" });
 
     var jwtSecurityScheme = new OpenApiSecurityScheme
     {
@@ -117,16 +127,10 @@ builder.Services.AddSwaggerGen(c =>
         Type = SecuritySchemeType.Http,
         Scheme = "bearer",
         Description = "Enter JWT token here **without** the word Bearer.",
-
-        Reference = new OpenApiReference
-        {
-            Id = "Bearer",
-            Type = ReferenceType.SecurityScheme
-        }
+        Reference = new OpenApiReference { Id = "Bearer", Type = ReferenceType.SecurityScheme }
     };
 
     c.AddSecurityDefinition(jwtSecurityScheme.Reference.Id, jwtSecurityScheme);
-
     c.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
         { jwtSecurityScheme, Array.Empty<string>() }
@@ -135,7 +139,13 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
-// 5) Seed roles + admin user 
+// Forwarded headers (safe; helps when behind reverse proxy)
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
+
+// Seed roles + admin user
 using (var scope = app.Services.CreateScope())
 {
     var roleManager = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole>>();
@@ -161,36 +171,34 @@ using (var scope = app.Services.CreateScope())
 
         var result = await userManager.CreateAsync(admin, "Admin123$");
         if (result.Succeeded)
-        {
             await userManager.AddToRoleAsync(admin, "Admin");
-        }
     }
 }
 
-// 6) Middleware pipeline
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+// Enable Swagger in ALL environments (so you can test on EC2/IIS)
+app.UseSwagger();
+app.UseSwaggerUI();
 
-app.UseHttpsRedirection();
+// IMPORTANT: don’t redirect to HTTPS until you configure HTTPS properly
+// app.UseHttpsRedirection();
 
-// CORS before Auth
+app.UseRouting();
+
+// CORS must be between Routing and Auth
 app.UseCors("FrontendClient");
 
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapControllers();
+// Apply CORS explicitly to endpoints
+app.MapControllers().RequireCors("FrontendClient");
 
-// Map SignalR Hub endpoint
-app.MapHub<JobTracker.API.Hubs.NotificationsHub>("/hubs/notifications");
+app.MapHub<NotificationsHub>("/hubs/notifications")
+   .RequireCors("FrontendClient");
 
 app.Run();
 
-
-//  UserId provider class
+// UserId provider class
 public class NameIdUserIdProvider : IUserIdProvider
 {
     public string? GetUserId(HubConnectionContext connection)

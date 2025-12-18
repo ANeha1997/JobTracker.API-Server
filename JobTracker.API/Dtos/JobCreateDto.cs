@@ -2,7 +2,7 @@
 {
     public class JobCreateDto
     {
-        public string Title { get; set; } = null!;
+        public string Title { get; set; } = "";
         public string? Location { get; set; }
         public string? EmploymentType { get; set; }
         public string? SeniorityLevel { get; set; }
